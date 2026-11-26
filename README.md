@@ -99,3 +99,7 @@ python experiments/train.py -c baselines/RoleST/SD.py --gpus '0'
 | **SD → GBA20** (2020) | **25.61 / 42.08** |
 | **SD → GLA20** (2020) | **30.01 / 50.61** |
 | **SD / GBA / GLA → CA** (8,600 sensors) | **32.20 / 29.00 / 28.52** |
+
+## Acknowledgements
+
+This codebase is built upon the open-source [BasicTS](https://github.com/GestaltCogTeam/BasicTS) time-series forecasting benchmark framework (v0.5.8) and evaluated on the [LargeST](https://github.com/liuxu77/LargeST) traffic benchmark. We sincerely thank the authors and contributors of BasicTS and LargeST for making their code and datasets publicly available.
