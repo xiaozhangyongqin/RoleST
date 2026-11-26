@@ -1,8 +1,8 @@
-"""Clean training and zero-shot cross-city evaluation entrypoint for RoleST.
+"""Zero-shot cross-city training and evaluation entrypoint for RoleST.
 
-Example:
-    python -m rolest.train \
-        --source SD --targets GBA GLA GBA_2020 GLA_2020 \
+Usage:
+    python -m baselines.RoleST.train \
+        --source SD --targets GBA GLA GBA_2020 GLA_2020 CA \
         --data-root datasets --output-dir runs/RoleST_SD
 """
 
@@ -13,14 +13,12 @@ import json
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler
 
-from .config import RoleSTConfig
+from .arch import RoleST
 from .data import MaskedMetrics, TrafficWindowDataset, compute_source_stats
-from .model import RoleST
 from .roles import StaticSourceGraphPrior, fit_flow_roles, load_adjacency
 
 
@@ -48,8 +46,8 @@ def role_st_loss(
     mask = torch.isfinite(target) & (target != null_val)
     pred_mae = (out["prediction"][mask] - target[mask]).abs().mean() / max(norm_scale, 1e-6)
 
-    logits = out["role_logits"]  # [B, N, P]
-    avail = out["available"]     # [B, N]
+    logits = out["role_logits"]
+    avail = out["available"]
     target_labels = labels.unsqueeze(0).expand_as(avail)
     role_ce = F.cross_entropy(logits[avail], target_labels[avail]) if avail.any() else logits.new_tensor(0.0)
 
@@ -66,16 +64,16 @@ def role_st_loss(
 @torch.no_grad()
 def evaluate_dataset(model: RoleST, ds: TrafficWindowDataset, batch_size: int, device: torch.device) -> dict[str, float]:
     model.eval()
-    metrics = MaskedMetrics(null_val=model.config.null_val or 0.0)
+    metrics = MaskedMetrics(null_val=model.null_val or 0.0)
     for x, y in DataLoader(ds, batch_size=batch_size, shuffle=False):
-        pred = model.predict(x.to(device, non_blocking=True))
+        pred = model(x.to(device, non_blocking=True), train=False)
         metrics.update(pred, y.to(device, non_blocking=True))
     return metrics.compute()
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Train and zero-shot evaluate RoleST.")
-    ap.add_argument("--source", required=True, help="Source city directory name (e.g., SD, GBA, GLA)")
+    ap.add_argument("--source", required=True, help="Source city directory name (SD, GBA, GLA)")
     ap.add_argument("--targets", nargs="+", required=True, help="Unseen target city directory names")
     ap.add_argument("--data-root", default="datasets")
     ap.add_argument("--output-dir", default="runs/RoleST")
@@ -103,12 +101,16 @@ def main() -> None:
     valid_ds = TrafficWindowDataset(root / args.source, split="valid")
     mean_s, std_s = compute_source_stats(train_ds.raw_flow)
 
-    cfg = RoleSTConfig(norm_mean=mean_s, norm_scale=std_s)
-    labels_np = fit_flow_roles(train_ds.raw_flow, num_roles=cfg.num_roles, seed=args.seed)
+    model_param = dict(
+        input_len=12, short_len=6, output_len=12, hidden_dim=192,
+        num_roles=48, phase_harmonics=4, mixer_strength=0.15,
+        spatial_gain_jitter=0.5, norm_mean=mean_s, norm_scale=std_s,
+    )
+    labels_np = fit_flow_roles(train_ds.raw_flow, num_roles=48, seed=args.seed)
     adj = load_adjacency(root / args.source / "adj_mx.pkl")
-    prior = StaticSourceGraphPrior(adj, labels_np, cfg.num_roles, device)
+    prior = StaticSourceGraphPrior(adj, labels_np, 48, device)
 
-    model = RoleST(cfg).to(device)
+    model = RoleST(**model_param).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[40, 65, 85], gamma=0.3)
 
@@ -123,23 +125,16 @@ def main() -> None:
         sampler = RandomSampler(train_ds, replacement=True, num_samples=n_samples, generator=gen)
         loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler)
 
-        # Linear warm-up for transition KL weight: 0 for ep<=5, ramps over ep 6..10 to 0.1
-        if epoch <= 5:
-            tw = 0.0
-        elif epoch <= 10:
-            tw = 0.1 * ((epoch - 5) / 5.0)
-        else:
-            tw = 0.1
-
+        tw = 0.0 if epoch <= 5 else (0.1 * ((epoch - 5) / 5.0) if epoch <= 10 else 0.1)
         total_loss = 0.0
         for x, y in loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             x, y = city_scale_jitter(x, y, args.city_scale_jitter)
-            out = model(x)
+            out = model.forward_with_roles(x)
             kt, active_rows = prior.coarse_target(out["available"])
             loss = role_st_loss(
                 out, y, prior.labels, kt, active_rows,
-                norm_scale=cfg.norm_scale, role_weight=0.1, transition_weight=tw,
+                norm_scale=std_s, role_weight=0.1, transition_weight=tw,
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -148,11 +143,10 @@ def main() -> None:
             total_loss += float(loss.item())
 
         scheduler.step()
-        val_m = evaluate_dataset(model, valid_ds, args.batch_size, device)
-        val_mae = val_m["MAE"]
+        val_mae = evaluate_dataset(model, valid_ds, args.batch_size, device)["MAE"]
         if val_mae < best_val:
             best_val, best_epoch, bad = val_mae, epoch, 0
-            torch.save({"config": cfg.to_dict(), "state_dict": model.state_dict(), "epoch": epoch}, best_path)
+            torch.save({"model_param": model_param, "state_dict": model.state_dict(), "epoch": epoch}, best_path)
         else:
             bad += 1
 
